@@ -9,6 +9,7 @@ from scipy.signal import stft
 from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
+from collections import Counter
 
 # ==========================================
 # 1. 人工设置参数 (USER CONFIGURATION)
@@ -16,26 +17,25 @@ from datetime import datetime
 
 # --- 路径设置 ---
 INPUT_DATASET_DIR = Path(r'E:\huangwenhao\dataset\train')
-PROCESSED_ROOT_DIR = Path(r'E:\huangwenhao\processed_datasets')
+PROCESSED_ROOT_DIR = Path(r'E:\huangwenhao\processed_datasets\v8')
 
 # [关键] 输出文件夹名称
-OUTPUT_FOLDER_NAME = 'v6_large_1' 
+OUTPUT_FOLDER_NAME = 'v8_small_jpg_1_fixed_2' 
 
-# --- 采样与划分设置 ---
-TOTAL_SAMPLES = 200        # -1: 全部处理
+# --- 图片保存格式设置 ---
+SAVE_IMAGE_FORMAT = 'jpg' 
+
+# --- 采样与数据集划分比例 ---
+TOTAL_SAMPLES = -1        # -1: 全部处理
 RANDOM_SEED = 42
-TRAIN_VAL_SPLIT_RATIO = 0.8 
+TRAIN_VAL_TEST_RATIO = (0.8, 0.1, 0.1)
 
 # --- 负样本掺入策略 ---
-NEGATIVE_RATIO = 0.06     # 累积配额制，正样本的 6%
+NEGATIVE_RATIO = 0.06     
 
 # --- STFT 信号处理设置 ---
-# --- [关键] 全图模式下的 STFT 策略 (v6 新增) ---
-# 仅当 ENABLE_SLICING = False 时生效
-# True:  强制使用 FREQ_RES_KHZ (保证信号内部纹理一致，但图片可能长宽比极端) -> 推荐
-# False: 自适应计算窗长 (保证图片接近正方形，但信号内部纹理会变)
-USE_FIXED_RES_IN_FULL_MODE = True 
-FREQ_RES_KHZ = 20          # 频率分辨率 (kHz)
+USE_FIXED_RES_IN_FULL_MODE = True      
+FREQ_RES_KHZ = 5         
 OVERLAP_RATIO = 0.5       
 USE_DB_SCALE = True
 
@@ -44,38 +44,44 @@ NORM_TYPE = 'GLOBAL'
 GLOBAL_MIN_DB = -140.0
 GLOBAL_MAX_DB = 30.0
 
-# --- [关键] 标签过滤设置 ---
-# === big ===
+# --- 标签过滤设置 (Small) ---
 TARGET_SIGNALS = {
-    0:  [20.0],
-    1:  [20.0],
-    2:  [20.0],
-    3:  [20.0, 40.0],
-    4:  [40.0],
-    5:  [40.0],
-    6:  [1.0],
-    7:  [2.0],
-    8:  [2.0],
-    10: [10.0],
-    11: [1.6, 7.56, 10.0],
+  9:  [0.0523, 0.0625, 0.25],
+  10: [0.3, 0.5],
+  12: [0.006, 0.2],
+  13: [0.04, 0.12, 0.2]
 }
-BW_TOLERANCE = 0.5 # [注意] 宽带信号的带宽误差可能会大一点，这里设宽一点 (0.5MHz) 比较安全
+BW_TOLERANCE = 0.002 
 
-# # === small ===
+# # === big ===
 # TARGET_SIGNALS = {
-#     9:  [0.0523, 0.0625, 0.25],
-#     10: [0.3, 0.5],
-#     12: [0.006, 0.2],
-#     13: [0.04, 0.12, 0.2]
+#     0:  [20.0],
+#     1:  [20.0],
+#     2:  [20.0],
+#     3:  [20.0, 40.0],
+#     4:  [40.0],
+#     5:  [40.0],
+#     6:  [1.0],
+#     7:  [2.0],
+#     8:  [2.0],
+#     10: [10.0],
+#     11: [1.6, 7.56, 10.0],
 # }
-# BW_TOLERANCE = 0.002 
+# BW_TOLERANCE = 0.5 
 
-# --- [关键] 切片 (Slicing) 设置 ---
-ENABLE_SLICING = False     # False = 全图; True = 切片
+# --- 切片设置 ---
+ENABLE_SLICING = True    
 
-SLICE_HEIGHT = 640         
+SLICE_HEIGHT = 640        
 SLICE_WIDTH = 640          
 SLICE_OVERLAP = 0.2        
+
+# [核心策略 1] 丢弃阈值 (小于此值直接丢弃，防止切片碎屑)
+MIN_VALID_PIXEL = 0.9
+
+# [核心策略 2] 膨胀阈值 (小于此值强制放大到此值)
+# 5.0 像素是给 YOLO 的"保命符"，抵抗随机缩放和Mosaic
+FORCE_MIN_SIZE_PIXEL = 5.0
 
 # --- 可视化设置 ---
 NUM_VISUAL_SAMPLES = 50
@@ -106,18 +112,15 @@ def is_target_signal(cls_id, bandwidth):
     return False
 
 def process_stft(iq_signal, fs, nperseg, noverlap, use_db, norm_min, norm_max):
-    # 执行 STFT
     f, t, Zxx = stft(iq_signal, fs=fs, window='hann', nperseg=nperseg, noverlap=noverlap, return_onesided=False)
     Zxx = np.fft.fftshift(Zxx, axes=0)
     magnitude = np.abs(Zxx)
     
-    # 转 dB 或 保持线性
     if use_db:
         data = 20 * np.log10(magnitude + 1e-12)
     else:
         data = magnitude
 
-    # 归一化
     if NORM_TYPE == 'GLOBAL':
         data = np.clip(data, norm_min, norm_max)
         data = (data - norm_min) / (norm_max - norm_min)
@@ -128,13 +131,11 @@ def process_stft(iq_signal, fs, nperseg, noverlap, use_db, norm_min, norm_max):
         else:
             data = np.zeros_like(data)
             
-    # 转图片
     img_u8 = (data * 255).astype(np.uint8)
     img_rgb = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
     return img_rgb, img_u8.shape
 
 def get_slice_coordinates(img_h, img_w):
-    # 如果不切片，返回唯一的全图坐标
     if not ENABLE_SLICING:
         return [(0, img_h, 0, img_w)]
 
@@ -155,23 +156,40 @@ def get_slice_coordinates(img_h, img_w):
         if y_end == img_h: break
     return slices
 
-def convert_box_to_yolo(box_px, img_w, img_h):
+def convert_box_to_yolo_inflated(box_px, img_w, img_h):
+    """
+    带有膨胀逻辑的坐标转换
+    box_px: (x1, y1, x2, y2) 绝对像素坐标
+    """
     x1, y1, x2, y2 = box_px
+    
+    # 原始宽高
+    w_px = x2 - x1
+    h_px = y2 - y1
+    
+    # [膨胀逻辑] 强制最小尺寸
+    # 如果小于阈值，强制设为阈值，保持中心点不变
+    final_w_px = max(w_px, FORCE_MIN_SIZE_PIXEL)
+    final_h_px = max(h_px, FORCE_MIN_SIZE_PIXEL)
+    
+    cx_px = x1 + w_px / 2.0
+    cy_px = y1 + h_px / 2.0
+    
+    # 归一化
     dw = 1.0 / img_w
     dh = 1.0 / img_h
-    w = x2 - x1
-    h = y2 - y1
-    cx = x1 + w / 2.0
-    cy = y1 + h / 2.0
-    return cx * dw, cy * dh, w * dw, h * dh
+    
+    return cx_px * dw, cy_px * dh, final_w_px * dw, final_h_px * dh
 
 def generate_yaml(output_dir):
     yaml_path = output_dir / f"{OUTPUT_FOLDER_NAME}.yaml"
     names_dict = {i: f"{i}" for i in range(14)}
+    
     content = [
         f"path: {output_dir.absolute()}", 
         "train: images/train",
         "val: images/valid",
+        "test: images/test",
         "",
         "names:",
     ]
@@ -182,14 +200,17 @@ def generate_yaml(output_dir):
         f.write('\n'.join(content))
     print(f"YAML 配置文件已生成: {yaml_path}")
 
-def save_settings(output_path):
+def save_initial_settings(output_path):
     with open(output_path, 'w') as f:
-        f.write(f"Dataset Settings (v6) - {datetime.now()}\n\n")
-
+        f.write(f"Dataset Settings (v8 Inflated) - {datetime.now()}\n")
+        f.write(f"Filter: Drop < {MIN_VALID_PIXEL} px\n")
+        f.write(f"Inflation: Force Min Size >= {FORCE_MIN_SIZE_PIXEL} px\n\n")
         f.write(f"total sample\t=\t{TOTAL_SAMPLES}\n")
-
-        if USE_FIXED_RES_IN_FULL_MODE:
-            f.write(f"freq resolution(kHz)\t=\t{FREQ_RES_KHZ}\n")
+        f.write(f"split ratio\t=\tTrain:{TRAIN_VAL_TEST_RATIO[0]} Val:{TRAIN_VAL_TEST_RATIO[1]} Test:{TRAIN_VAL_TEST_RATIO[2]}\n")
+        f.write(f"format\t\t\t=\t{SAVE_IMAGE_FORMAT}\n")
+        
+        if USE_FIXED_RES_IN_FULL_MODE or ENABLE_SLICING:
+            f.write(f"freq resolution\t=\t{FREQ_RES_KHZ}\t(kHz)\n")
         else:
             f.write(f"freq resolution\t=\tAdaptive\n")
         
@@ -197,18 +218,51 @@ def save_settings(output_path):
             f.write(f"dB or linear\t=\tdB\n")
         else:
             f.write(f"dB or linear\t=\tlinear\n")
-        
-        if NORM_TYPE == 'GLOBAL':
-            f.write(f"norm\t\t\t=\tglobal\t(min_dB = {GLOBAL_MIN_DB}; max_dB = {GLOBAL_MAX_DB})\n")
-        else:
-            f.write(f"norm\t\t\t=\tsample\n")
-
+            
+        f.write(f"norm\t\t\t=\t{NORM_TYPE}\n")
         f.write(f"targets signals\t=\t{json.dumps(TARGET_SIGNALS)}\n")
 
-        if ENABLE_SLICING:
-            f.write(f"small or large\t=\tsmall\n")
-        else:
-            f.write(f"small or large\t=\tlarge\n")
+def perform_distribution_check(train_bins, valid_bins, test_bins, settings_path):
+    print("\n>>> 开始执行分布预检查 (Scanning JSONs)...")
+    
+    def count_in_dataset(bin_list):
+        c = Counter()
+        for bin_file in bin_list:
+            json_path = INPUT_DATASET_DIR / f'{bin_file.stem}.json'
+            if not json_path.exists(): continue
+            try:
+                with open(json_path, 'r') as f: meta = json.load(f)
+                for sig in meta.get('signals', []):
+                    obs_range = meta['observation_range']
+                    bw = sig['end_frequency'] - sig['start_frequency']
+                    if is_target_signal(sig['class'], bw):
+                        c[sig['class']] += 1
+            except Exception:
+                pass
+        return c
+
+    train_counts = count_in_dataset(train_bins)
+    valid_counts = count_in_dataset(valid_bins)
+    test_counts = count_in_dataset(test_bins)
+    target_ids = sorted(list(TARGET_SIGNALS.keys()))
+    
+    header = f"{'Class ID':<10} | {'Train':<10} | {'Val':<10} | {'Test':<10}"
+    print("-" * 50)
+    print(header)
+    print("-" * 50)
+    for cid in target_ids:
+        print(f"{cid:<10} | {train_counts[cid]:<10} | {valid_counts[cid]:<10} | {test_counts[cid]:<10}")
+    print("-" * 50)
+    print(">>> 预检查完成。\n")
+
+    with open(settings_path, 'a') as f:
+        f.write("\n\n" + "="*40 + "\n")
+        f.write("Class Distribution Statistics\n")
+        f.write("="*40 + "\n")
+        f.write(f"{'Class ID':<10}\t{'Train':<10}\t{'Val':<10}\t{'Test':<10}\n")
+        for cid in target_ids:
+            f.write(f"{cid:<10}\t{train_counts[cid]:<10}\t{valid_counts[cid]:<10}\t{test_counts[cid]:<10}\n")
+        f.write("="*40 + "\n")
 
 # ==========================================
 # 3. 主处理流程
@@ -217,34 +271,27 @@ def save_settings(output_path):
 def main():
     output_dir = PROCESSED_ROOT_DIR / OUTPUT_FOLDER_NAME
     norm_min, norm_max = calculate_params(GLOBAL_MIN_DB, GLOBAL_MAX_DB, USE_DB_SCALE)
+    img_ext = '.jpg' if SAVE_IMAGE_FORMAT.lower() == 'jpg' else '.png'
     
-    print(f"--- 预处理开始 (v6) ---")
+    print(f"--- 预处理开始 (v8 Inflated: Drop <0.9px, Inflate to 5.0px) ---")
     
-    # 逻辑判断打印
-    use_fixed_res = False
-    if ENABLE_SLICING:
-        print(f"模式: 切片处理 | 分辨率: 固定 {FREQ_RES_KHZ} kHz")
-        use_fixed_res = True
-    else:
-        if USE_FIXED_RES_IN_FULL_MODE:
-            print(f"模式: 全图处理 | 分辨率: 固定 {FREQ_RES_KHZ} kHz (特征一致性优先)")
-            use_fixed_res = True
-        else:
-            print(f"模式: 全图处理 | 分辨率: 自适应方形窗 (几何比例优先)")
-            use_fixed_res = False
-
-    print(f"输出目录: {output_dir}")
-    print(f"关注信号: {list(TARGET_SIGNALS.keys())}")
+    if abs(sum(TRAIN_VAL_TEST_RATIO) - 1.0) > 1e-6:
+        print("Error: 训练/验证/测试比例之和不为 1！")
+        return
 
     dirs = {
         'train_img': output_dir / 'images/train',
         'valid_img': output_dir / 'images/valid',
+        'test_img':  output_dir / 'images/test',
         'train_lbl': output_dir / 'labels/train',
         'valid_lbl': output_dir / 'labels/valid',
+        'test_lbl':  output_dir / 'labels/test',
         'visual': output_dir / 'visual'
     }
     ensure_dirs(dirs.values())
-    save_settings(output_dir / 'settings.txt')
+    
+    settings_path = output_dir / 'settings.txt'
+    save_initial_settings(settings_path)
     generate_yaml(output_dir)
 
     all_bins = list(INPUT_DATASET_DIR.glob('*.bin'))
@@ -256,10 +303,19 @@ def main():
     
     random.seed(RANDOM_SEED)
     random.shuffle(sample_bins)
-    split_idx = int(len(sample_bins) * TRAIN_VAL_SPLIT_RATIO)
-    train_bins = sample_bins[:split_idx]
-    valid_bins = sample_bins[split_idx:]
     
+    n_total = len(sample_bins)
+    n_train = int(n_total * TRAIN_VAL_TEST_RATIO[0])
+    n_val = int(n_total * TRAIN_VAL_TEST_RATIO[1])
+    
+    train_bins = sample_bins[:n_train]
+    valid_bins = sample_bins[n_train : n_train + n_val]
+    test_bins = sample_bins[n_train + n_val :]
+    
+    print(f"划分结果: Train={len(train_bins)}, Val={len(valid_bins)}, Test={len(test_bins)}")
+
+    perform_distribution_check(train_bins, valid_bins, test_bins, settings_path)
+
     viz_candidates = [] 
 
     def process_split_set(bin_files, img_dst_dir, lbl_dst_dir, desc_text):
@@ -278,28 +334,19 @@ def main():
             bw_mhz = f_max - f_min
             fs = bw_mhz * 1e6
             
-            # --- 1. 读取信号 ---
             raw_data = np.fromfile(bin_file, dtype=np.float16)
             signal = raw_data[::2] + 1j * raw_data[1::2]
             signal_len = len(signal)
             duration_sec = signal_len / fs
             
-            # --- 2. 确定 STFT 参数 (v6 逻辑) ---
-            # 判断是否使用固定分辨率
             use_fixed_for_this_run = False
-            if ENABLE_SLICING:
-                use_fixed_for_this_run = True
-            elif USE_FIXED_RES_IN_FULL_MODE:
+            if ENABLE_SLICING or USE_FIXED_RES_IN_FULL_MODE:
                 use_fixed_for_this_run = True
             
             if use_fixed_for_this_run:
-                # 模式 A: 固定分辨率 (保证纹理一致)
                 nperseg = int(fs / (FREQ_RES_KHZ * 1000))
-                # 保护措施：防止 nperseg 大于信号长度
-                if nperseg > signal_len:
-                    nperseg = signal_len
+                if nperseg > signal_len: nperseg = signal_len
             else:
-                # 模式 B: 自适应方形窗 (保证图片形状)
                 try:
                     calculated_nperseg = int(math.sqrt(signal_len / (1 - OVERLAP_RATIO)))
                     if calculated_nperseg % 2 != 0: calculated_nperseg += 1
@@ -309,11 +356,8 @@ def main():
                     nperseg = 256
 
             noverlap = int(nperseg * OVERLAP_RATIO)
-            
-            # --- 3. 执行 STFT ---
             img_rgb, (full_h, full_w) = process_stft(signal, fs, nperseg, noverlap, USE_DB_SCALE, norm_min, norm_max)
             
-            # --- 4. 标签解析 ---
             valid_boxes = [] 
             for sig in meta.get('signals', []):
                 if is_target_signal(sig['class'], sig['end_frequency'] - sig['start_frequency']):
@@ -326,7 +370,6 @@ def main():
                     if x2 > x1 and y2 > y1:
                         valid_boxes.append([x1, y1, x2, y2, sig['class']])
 
-            # --- 5. 切片与分类 ---
             file_pos_count = 0
             file_neg_buffer = [] 
             
@@ -339,27 +382,39 @@ def main():
                 for box in valid_boxes:
                     bx1, by1, bx2, by2, cid = box
                     ix1, iy1, ix2, iy2 = max(bx1, sx1), max(by1, sy1), min(bx2, sx2), min(by2, sy2)
-                    if ix2 > ix1 and iy2 > iy1:
-                        cx, cy, w, h = convert_box_to_yolo((ix1-sx1, iy1-sy1, ix2-sx1, iy2-sy1), slice_w, slice_h)
-                        slice_labels.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+                    
+                    # [核心逻辑更新]
+                    clipped_w = ix2 - ix1
+                    clipped_h = iy2 - iy1
+                    
+                    # 1. 过滤掉 0.9px 以下的碎屑
+                    if clipped_w >= MIN_VALID_PIXEL and clipped_h >= MIN_VALID_PIXEL:
+                        # 2. 计算膨胀后的坐标
+                        # 传入切片内的相对像素坐标，内部会执行 max(w, 5.0)
+                        cx, cy, w, h = convert_box_to_yolo_inflated((ix1-sx1, iy1-sy1, ix2-sx1, iy2-sy1), slice_w, slice_h)
+                        
+                        # 3. 最终写入
+                        if w > 0.001 and h > 0.001:
+                            slice_labels.append(f"{cid} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
                 
                 base_name = f"{file_idx}" if not ENABLE_SLICING else f"{file_idx}_s{i}"
                 
                 if slice_labels:
-                    # [正样本] -> 保存
                     img_slice = img_rgb[sy1:sy2, sx1:sx2]
-                    cv2.imwrite(str(img_dst_dir / f"{base_name}.png"), img_slice)
-                    with open(lbl_dst_dir / f"{base_name}.txt", 'w') as f_lbl:
+                    save_path = img_dst_dir / f"{base_name}{img_ext}"
+                    lbl_path = lbl_dst_dir / f"{base_name}.txt"
+                    
+                    cv2.imwrite(str(save_path), img_slice)
+                    with open(lbl_path, 'w') as f_lbl:
                         f_lbl.write('\n'.join(slice_labels))
-                    viz_candidates.append((img_dst_dir / f"{base_name}.png", lbl_dst_dir / f"{base_name}.txt"))
+                    
+                    viz_candidates.append((save_path, lbl_path))
                     file_pos_count += 1
                     count_pos += 1
                 else:
-                    # [负样本] -> 缓冲
                     img_slice = img_rgb[sy1:sy2, sx1:sx2]
                     file_neg_buffer.append((img_slice, base_name))
             
-            # --- 6. 负样本配额结算 ---
             neg_quota_balance += file_pos_count * NEGATIVE_RATIO
             num_to_save = int(neg_quota_balance)
             
@@ -367,19 +422,20 @@ def main():
                 actual_save = min(num_to_save, len(file_neg_buffer))
                 selected = random.sample(file_neg_buffer, actual_save)
                 for img, name in selected:
-                    cv2.imwrite(str(img_dst_dir / f"{name}.png"), img)
+                    save_path = img_dst_dir / f"{name}{img_ext}"
+                    cv2.imwrite(str(save_path), img)
                     with open(lbl_dst_dir / f"{name}.txt", 'w') as f_lbl: pass 
                     count_neg += 1
                 neg_quota_balance -= actual_save
             
             del file_neg_buffer, img_rgb, raw_data
 
-        print(f"[{desc_text}] 完成. 累计: 正样本 {count_pos}, 负样本 {count_neg}")
+        print(f"[{desc_text}] 完成. 累计: 正样本 {count_pos}, 负样本 {count_neg}")  
 
     process_split_set(train_bins, dirs['train_img'], dirs['train_lbl'], "Generating Train Set")
     process_split_set(valid_bins, dirs['valid_img'], dirs['valid_lbl'], "Generating Valid Set")
+    process_split_set(test_bins,  dirs['test_img'],  dirs['test_lbl'],  "Generating Test Set")
 
-    # 可视化
     print("\nStep 3: Generating Visualization...")
     if viz_candidates:
         random.seed(RANDOM_SEED)
@@ -401,7 +457,7 @@ def main():
                         y2 = int((cy + bh/2) * h)
                         cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
                         cv2.putText(img, f"{cls_id}", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-            cv2.imwrite(str(dirs['visual'] / f"vis_{img_p.name}"), img)
+            cv2.imwrite(str(dirs['visual'] / f"vis_{img_p.stem}.jpg"), img)
     
     print(f"\n全部流程结束！")
 

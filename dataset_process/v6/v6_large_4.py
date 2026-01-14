@@ -19,10 +19,10 @@ INPUT_DATASET_DIR = Path(r'E:\huangwenhao\dataset\train')
 PROCESSED_ROOT_DIR = Path(r'E:\huangwenhao\processed_datasets')
 
 # [关键] 输出文件夹名称
-OUTPUT_FOLDER_NAME = 'v6_small_2' 
+OUTPUT_FOLDER_NAME = 'v6_large_4' 
 
 # --- 采样与划分设置 ---
-TOTAL_SAMPLES = 200        # -1: 全部处理
+TOTAL_SAMPLES = -1        # -1: 全部处理
 RANDOM_SEED = 42
 TRAIN_VAL_SPLIT_RATIO = 0.8 
 
@@ -34,44 +34,44 @@ NEGATIVE_RATIO = 0.06     # 累积配额制，正样本的 6%
 # 仅当 ENABLE_SLICING = False 时生效
 # True:  强制使用 FREQ_RES_KHZ (保证信号内部纹理一致，但图片可能长宽比极端) -> 推荐
 # False: 自适应计算窗长 (保证图片接近正方形，但信号内部纹理会变)
-USE_FIXED_RES_IN_FULL_MODE = True 
-FREQ_RES_KHZ = 5          # 频率分辨率 (kHz)
+USE_FIXED_RES_IN_FULL_MODE = False  # === compare with 3 === 
+FREQ_RES_KHZ = 20          # 频率分辨率 (kHz)
 OVERLAP_RATIO = 0.5       
-USE_DB_SCALE = False        # === compare with v6_small_1.py === 
+USE_DB_SCALE = True
 
 # --- 归一化设置 ---
 NORM_TYPE = 'GLOBAL'
-GLOBAL_MIN_DB = -140.0
-GLOBAL_MAX_DB = 30.0
+GLOBAL_MIN_DB = -60.0      # === compare with 1 === 
+GLOBAL_MAX_DB = 0.0        # === compare with 1 === 
 
 # --- [关键] 标签过滤设置 ---
-# # === big ===
-# TARGET_SIGNALS = {
-#     0:  [20.0],
-#     1:  [20.0],
-#     2:  [20.0],
-#     3:  [20.0, 40.0],
-#     4:  [40.0],
-#     5:  [40.0],
-#     6:  [1.0],
-#     7:  [2.0],
-#     8:  [2.0],
-#     10: [10.0],
-#     11: [1.6, 7.56, 10.0],
-# }
-# BW_TOLERANCE = 0.5 # [注意] 宽带信号的带宽误差可能会大一点，这里设宽一点 (0.5MHz) 比较安全
-
-# === small ===
+# === big ===
 TARGET_SIGNALS = {
-    9:  [0.0523, 0.0625, 0.25],
-    10: [0.3, 0.5],
-    12: [0.006, 0.2],
-    13: [0.04, 0.12, 0.2]
+    0:  [20.0],
+    1:  [20.0],
+    2:  [20.0],
+    3:  [20.0, 40.0],
+    4:  [40.0],
+    5:  [40.0],
+    6:  [1.0],
+    7:  [2.0],
+    8:  [2.0],
+    10: [10.0],
+    11: [1.6, 7.56, 10.0],
 }
-BW_TOLERANCE = 0.002 
+BW_TOLERANCE = 0.5 # [注意] 宽带信号的带宽误差可能会大一点，这里设宽一点 (0.5MHz) 比较安全
+
+# # === small ===
+# TARGET_SIGNALS = {
+#     9:  [0.0523, 0.0625, 0.25],
+#     10: [0.3, 0.5],
+#     12: [0.006, 0.2],
+#     13: [0.04, 0.12, 0.2]
+# }
+# BW_TOLERANCE = 0.002 
 
 # --- [关键] 切片 (Slicing) 设置 ---
-ENABLE_SLICING = True     # False = 全图; True = 切片
+ENABLE_SLICING = False     # False = 全图; True = 切片
 
 SLICE_HEIGHT = 640         
 SLICE_WIDTH = 640          

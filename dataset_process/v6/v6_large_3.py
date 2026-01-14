@@ -15,14 +15,14 @@ from datetime import datetime
 # ==========================================
 
 # --- 路径设置 ---
-INPUT_DATASET_DIR = Path('/data/hwh_data_folder/dataset/train')
-PROCESSED_ROOT_DIR = Path('/data/hwh_data_folder/processed_datasets')
+INPUT_DATASET_DIR = Path(r'E:\huangwenhao\dataset\train')
+PROCESSED_ROOT_DIR = Path(r'E:\huangwenhao\processed_datasets')
 
 # [关键] 输出文件夹名称
-OUTPUT_FOLDER_NAME = 'yolo_train_set_v5_500_small' 
+OUTPUT_FOLDER_NAME = 'v6_large_3' 
 
 # --- 采样与划分设置 ---
-TOTAL_SAMPLES = 500        # >0: 随机采样数; -1: 全部处理; 
+TOTAL_SAMPLES = -1        # -1: 全部处理
 RANDOM_SEED = 42
 TRAIN_VAL_SPLIT_RATIO = 0.8 
 
@@ -30,51 +30,55 @@ TRAIN_VAL_SPLIT_RATIO = 0.8
 NEGATIVE_RATIO = 0.06     # 累积配额制，正样本的 6%
 
 # --- STFT 信号处理设置 ---
-# [注意] 如果 ENABLE_SLICING = False (大信号模式)，FREQ_RES_KHZ 将被忽略，
-# 代码会自动计算窗长以生成方形图片。
-FREQ_RES_KHZ = 5          
+# --- [关键] 全图模式下的 STFT 策略 (v6 新增) ---
+# 仅当 ENABLE_SLICING = False 时生效
+# True:  强制使用 FREQ_RES_KHZ (保证信号内部纹理一致，但图片可能长宽比极端) -> 推荐
+# False: 自适应计算窗长 (保证图片接近正方形，但信号内部纹理会变)
+USE_FIXED_RES_IN_FULL_MODE = True 
+FREQ_RES_KHZ = 20          # 频率分辨率 (kHz)
 OVERLAP_RATIO = 0.5       
 USE_DB_SCALE = True
 
 # --- 归一化设置 ---
 NORM_TYPE = 'GLOBAL'
-GLOBAL_MIN_DB = -140.0
-GLOBAL_MAX_DB = 30.0
+GLOBAL_MIN_DB = -60.0      # === compare with 1 === 
+GLOBAL_MAX_DB = 0.0        # === compare with 1 === 
 
 # --- [关键] 标签过滤设置 ---
-# # === big ===
-# TARGET_SIGNALS = {
-#     0:  [20.0],
-#     1:  [20.0],
-#     2:  [20.0],
-#     3:  [20.0, 40.0],
-#     4:  [40.0],
-#     5:  [40.0],
-#     6:  [1.0],
-#     7:  [2.0],
-#     8:  [2.0],
-#     10: [10.0],
-#     11: [1.6, 7.56, 10.0],
-# }
-# BW_TOLERANCE = 0.5 # [注意] 宽带信号的带宽误差可能会大一点，这里设宽一点 (0.5MHz) 比较安全
-
-# === small ===
+# === big ===
 TARGET_SIGNALS = {
-    9:  [0.0523, 0.0625, 0.25],
-    10: [0.3, 0.5],
-    12: [0.006, 0.2],
-    13: [0.04, 0.12, 0.2]
+    0:  [20.0],
+    1:  [20.0],
+    2:  [20.0],
+    3:  [20.0, 40.0],
+    4:  [40.0],
+    5:  [40.0],
+    6:  [1.0],
+    7:  [2.0],
+    8:  [2.0],
+    10: [10.0],
+    11: [1.6, 7.56, 10.0],
 }
-BW_TOLERANCE = 0.002 
+BW_TOLERANCE = 0.5 # [注意] 宽带信号的带宽误差可能会大一点，这里设宽一点 (0.5MHz) 比较安全
+
+# # === small ===
+# TARGET_SIGNALS = {
+#     9:  [0.0523, 0.0625, 0.25],
+#     10: [0.3, 0.5],
+#     12: [0.006, 0.2],
+#     13: [0.04, 0.12, 0.2]
+# }
+# BW_TOLERANCE = 0.002 
 
 # --- [关键] 切片 (Slicing) 设置 ---
-ENABLE_SLICING = True     # False = 全图(自适应方形窗); True = 切片(固定频率分辨率)
+ENABLE_SLICING = False     # False = 全图; True = 切片
+
 SLICE_HEIGHT = 640         
 SLICE_WIDTH = 640          
 SLICE_OVERLAP = 0.2        
 
 # --- 可视化设置 ---
-NUM_VISUAL_SAMPLES = 100
+NUM_VISUAL_SAMPLES = 50
 
 # ==========================================
 # 2. 辅助函数定义
@@ -130,7 +134,7 @@ def process_stft(iq_signal, fs, nperseg, noverlap, use_db, norm_min, norm_max):
     return img_rgb, img_u8.shape
 
 def get_slice_coordinates(img_h, img_w):
-    # [逻辑统一] 如果不切片，返回唯一的全图坐标
+    # 如果不切片，返回唯一的全图坐标
     if not ENABLE_SLICING:
         return [(0, img_h, 0, img_w)]
 
@@ -180,16 +184,31 @@ def generate_yaml(output_dir):
 
 def save_settings(output_path):
     with open(output_path, 'w') as f:
-        f.write(f"Dataset Settings (v5) - {datetime.now()}\n")
-        f.write(f"ENABLE_SLICING: {ENABLE_SLICING}\n")
-        f.write(f"TARGET_SIGNALS: {json.dumps(TARGET_SIGNALS)}\n")
-        f.write(f"TOTAL_SAMPLES: {TOTAL_SAMPLES}\n")
-        f.write(f"NEGATIVE_RATIO: {NEGATIVE_RATIO}\n")
-        f.write(f"NORM_TYPE: {NORM_TYPE}\n")
-        if not ENABLE_SLICING:
-            f.write("MODE: Adaptive Square Window (Auto nperseg)\n")
+        f.write(f"Dataset Settings (v6) - {datetime.now()}\n\n")
+
+        f.write(f"total sample\t=\t{TOTAL_SAMPLES}\n")
+
+        if USE_FIXED_RES_IN_FULL_MODE:
+            f.write(f"freq resolution(kHz)\t=\t{FREQ_RES_KHZ}\n")
         else:
-            f.write(f"MODE: Fixed Resolution ({FREQ_RES_KHZ} kHz)\n")
+            f.write(f"freq resolution\t=\tAdaptive\n")
+        
+        if USE_DB_SCALE:
+            f.write(f"dB or linear\t=\tdB\n")
+        else:
+            f.write(f"dB or linear\t=\tlinear\n")
+        
+        if NORM_TYPE == 'GLOBAL':
+            f.write(f"norm\t\t\t=\tglobal\t(min_dB = {GLOBAL_MIN_DB}; max_dB = {GLOBAL_MAX_DB})\n")
+        else:
+            f.write(f"norm\t\t\t=\tsample\n")
+
+        f.write(f"targets signals\t=\t{json.dumps(TARGET_SIGNALS)}\n")
+
+        if ENABLE_SLICING:
+            f.write(f"small or large\t=\tsmall\n")
+        else:
+            f.write(f"small or large\t=\tlarge\n")
 
 # ==========================================
 # 3. 主处理流程
@@ -199,12 +218,21 @@ def main():
     output_dir = PROCESSED_ROOT_DIR / OUTPUT_FOLDER_NAME
     norm_min, norm_max = calculate_params(GLOBAL_MIN_DB, GLOBAL_MAX_DB, USE_DB_SCALE)
     
-    print(f"--- 预处理开始 (v5) ---")
-    if ENABLE_SLICING:
-        print(f"模式: 切片处理 (小信号) | STFT分辨率: {FREQ_RES_KHZ} kHz")
-    else:
-        print(f"模式: 全图处理 (大信号) | STFT策略: 自适应方形窗 (忽略分辨率设置)")
+    print(f"--- 预处理开始 (v6) ---")
     
+    # 逻辑判断打印
+    use_fixed_res = False
+    if ENABLE_SLICING:
+        print(f"模式: 切片处理 | 分辨率: 固定 {FREQ_RES_KHZ} kHz")
+        use_fixed_res = True
+    else:
+        if USE_FIXED_RES_IN_FULL_MODE:
+            print(f"模式: 全图处理 | 分辨率: 固定 {FREQ_RES_KHZ} kHz (特征一致性优先)")
+            use_fixed_res = True
+        else:
+            print(f"模式: 全图处理 | 分辨率: 自适应方形窗 (几何比例优先)")
+            use_fixed_res = False
+
     print(f"输出目录: {output_dir}")
     print(f"关注信号: {list(TARGET_SIGNALS.keys())}")
 
@@ -219,7 +247,6 @@ def main():
     save_settings(output_dir / 'settings.txt')
     generate_yaml(output_dir)
 
-    # 采样与划分
     all_bins = list(INPUT_DATASET_DIR.glob('*.bin'))
     if TOTAL_SAMPLES != -1 and TOTAL_SAMPLES < len(all_bins):
         random.seed(RANDOM_SEED)
@@ -257,24 +284,29 @@ def main():
             signal_len = len(signal)
             duration_sec = signal_len / fs
             
-            # --- 2. 确定 STFT 参数 (v5 新特性) ---
+            # --- 2. 确定 STFT 参数 (v6 逻辑) ---
+            # 判断是否使用固定分辨率
+            use_fixed_for_this_run = False
             if ENABLE_SLICING:
-                # 模式 A: 固定分辨率 (小信号切片)
+                use_fixed_for_this_run = True
+            elif USE_FIXED_RES_IN_FULL_MODE:
+                use_fixed_for_this_run = True
+            
+            if use_fixed_for_this_run:
+                # 模式 A: 固定分辨率 (保证纹理一致)
                 nperseg = int(fs / (FREQ_RES_KHZ * 1000))
+                # 保护措施：防止 nperseg 大于信号长度
+                if nperseg > signal_len:
+                    nperseg = signal_len
             else:
-                # 模式 B: 自适应方形窗 (大信号全图)
-                # 目标: FreqBins (nperseg) ≈ TimeSteps
-                # 公式: W ≈ sqrt( L / (1-Overlap) )
+                # 模式 B: 自适应方形窗 (保证图片形状)
                 try:
                     calculated_nperseg = int(math.sqrt(signal_len / (1 - OVERLAP_RATIO)))
-                    # 保证 nperseg 是偶数且不大于信号长度
-                    if calculated_nperseg % 2 != 0:
-                        calculated_nperseg += 1
+                    if calculated_nperseg % 2 != 0: calculated_nperseg += 1
                     nperseg = min(calculated_nperseg, signal_len)
-                    # 极短信号保护
                     nperseg = max(nperseg, 64) 
                 except ValueError:
-                    nperseg = 256 # Fallback
+                    nperseg = 256
 
             noverlap = int(nperseg * OVERLAP_RATIO)
             
@@ -285,18 +317,12 @@ def main():
             valid_boxes = [] 
             for sig in meta.get('signals', []):
                 if is_target_signal(sig['class'], sig['end_frequency'] - sig['start_frequency']):
-                    # 坐标映射: 时间轴
                     x1 = (sig['start_time'] / 1000.0 / duration_sec) * full_w
                     x2 = (sig['end_time'] / 1000.0 / duration_sec) * full_w
-                    
-                    # 坐标映射: 频率轴
-                    # 注意: STFT Shift后，Top=MinFreq, Bottom=MaxFreq
                     y1 = ((sig['start_frequency'] - f_min) / bw_mhz) * full_h
                     y2 = ((sig['end_frequency'] - f_min) / bw_mhz) * full_h
-                    
                     x1, x2 = np.clip([x1, x2], 0, full_w)
                     y1, y2 = np.clip([y1, y2], 0, full_h)
-                    
                     if x2 > x1 and y2 > y1:
                         valid_boxes.append([x1, y1, x2, y2, sig['class']])
 
@@ -304,7 +330,6 @@ def main():
             file_pos_count = 0
             file_neg_buffer = [] 
             
-            # 获取切片坐标 (全图模式下只返回一个全尺寸切片)
             slice_coords = get_slice_coordinates(full_h, full_w)
 
             for i, (sy1, sy2, sx1, sx2) in enumerate(slice_coords):
@@ -343,7 +368,7 @@ def main():
                 selected = random.sample(file_neg_buffer, actual_save)
                 for img, name in selected:
                     cv2.imwrite(str(img_dst_dir / f"{name}.png"), img)
-                    with open(lbl_dst_dir / f"{name}.txt", 'w') as f_lbl: pass # 空标签
+                    with open(lbl_dst_dir / f"{name}.txt", 'w') as f_lbl: pass 
                     count_neg += 1
                 neg_quota_balance -= actual_save
             
