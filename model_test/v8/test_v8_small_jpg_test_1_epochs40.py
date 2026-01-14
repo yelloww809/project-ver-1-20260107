@@ -10,7 +10,9 @@ def main():
         batch=32,
         device='cuda:0',
         project=r'E:\huangwenhao\runs\v8\test',
-        name='test_v8_small_jpg_test_1_epochs40'
+        name='test_v8_small_jpg_test_1_epochs40_conf0.25_iou0.45',
+        conf=0.25,
+        iou=0.45,
     )
 
 if __name__ == '__main__':
