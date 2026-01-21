@@ -7,8 +7,7 @@ import math
 from scipy.signal import stft
 from ultralytics import YOLO
 
-# ================= 配置区域 =================
-# [必须与 v8 训练完全一致]
+# ================= 配置区域 (保持与训练一致) =================
 GLOBAL_MIN_DB = -140.0
 GLOBAL_MAX_DB = 30.0
 FREQ_RES_LARGE = 20  # kHz
@@ -17,29 +16,25 @@ OVERLAP_RATIO = 0.5
 SLICE_SIZE = 640
 SLICE_OVERLAP = 0.2
 
-# 路由逻辑: 10类信号两边都测
+# 路由逻辑
 LARGE_IGNORED_CLASSES = [9, 12, 13] 
 SMALL_TARGET_CLASSES = [9, 10, 12, 13]
 
 class SignalInferenceSystem:
-    def __init__(self, large_model_path, small_model_path, device='cuda'):
-        print(">>> Loading Models...")
+    def __init__(self, large_model_path, small_model_path, device='cuda:0'):
+        print(f">>> Loading Models on {device}...")
+        self.device = device
         self.model_large = YOLO(large_model_path)
         self.model_small = YOLO(small_model_path)
-        self.device = device
         print(">>> Models Loaded.")
 
     def _process_stft_v8_aligned(self, iq_signal, fs, freq_res_khz):
-        """
-        [完全复刻 v8_large_jpg_1 的预处理逻辑]
-        """
+        """完全复刻 v8 训练时的预处理逻辑"""
         signal_len = len(iq_signal)
         
-        # 1. 计算 nperseg (v8逻辑)
-        # v8: nperseg = int(fs / (FREQ_RES_KHZ * 1000))
+        # 1. 计算 nperseg
         nperseg = int(fs / (freq_res_khz * 1000))
         if nperseg > signal_len: nperseg = signal_len
-        # v8 中有 max(nperseg, 64) 保护
         if nperseg < 64: nperseg = 64 
         
         noverlap = int(nperseg * OVERLAP_RATIO)
@@ -49,14 +44,12 @@ class SignalInferenceSystem:
         Zxx = np.fft.fftshift(Zxx, axes=0)
         magnitude = np.abs(Zxx)
         
-        # 3. dB Scale
+        # 3. dB & Norm
         data = 20 * np.log10(magnitude + 1e-12)
-        
-        # 4. Global Norm (v8逻辑)
         data = np.clip(data, GLOBAL_MIN_DB, GLOBAL_MAX_DB)
         data = (data - GLOBAL_MIN_DB) / (GLOBAL_MAX_DB - GLOBAL_MIN_DB)
         
-        # 5. Convert to Image
+        # 4. Image
         img_u8 = (data * 255).astype(np.uint8)
         img_rgb = cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
         return img_rgb, img_u8.shape
@@ -84,7 +77,6 @@ class SignalInferenceSystem:
         else:
             return np.array(data_obj)
 
-    # ... (_calculate_1d_overlap 和 _stitch_1d 保持之前的版本不变，此处省略以节省篇幅) ...
     def _calculate_1d_overlap(self, range1, range2):
         inter_min = max(range1[0], range2[0])
         inter_max = min(range1[1], range2[1])
@@ -111,9 +103,12 @@ class SignalInferenceSystem:
                 next_main = [next_box[0], next_box[2]]       if main_axis_idx == 0 else [next_box[1], next_box[3]]
                 curr_cross = [current_box[1], current_box[3]] if main_axis_idx == 0 else [current_box[0], current_box[2]]
                 next_cross = [next_box[1], next_box[3]]       if main_axis_idx == 0 else [next_box[0], next_box[2]]
+                
                 cross_iou = self._calculate_1d_overlap(curr_cross, next_cross)
                 is_connected = (next_main[0] <= curr_main[1] + gap_thresh)
+                
                 if cross_iou > overlap_thresh and is_connected:
+                    # 合并逻辑
                     if main_axis_idx == 0:
                         current_box[2] = max(current_box[2], next_box[2])
                         current_box[0] = min(current_box[0], next_box[0])
@@ -131,11 +126,11 @@ class SignalInferenceSystem:
             merged_boxes.append(current_box)
         return np.array(merged_boxes)
 
-    def predict(self, bin_path, json_path, conf_thres=0.001, iou_thres=0.6):
+    def predict(self, bin_path, json_path, conf_thres=0.2, iou_thres=0.7):
         """
-        [关键修改]
-        默认 conf_thres 设为 0.001 以匹配 model.val() 的 mAP 计算标准
-        默认 iou_thres 设为 0.6
+        conf_thres: 设为 0.001 以获取尽可能多的候选框用于计算 mAP
+        iou_thres: NMS 阈值，通常 0.6 或 0.7
+        rect: Large 分支必须开启，模拟 val 时的矩形推理
         """
         # 1. 读取数据
         with open(json_path, 'r') as f:
@@ -149,15 +144,14 @@ class SignalInferenceSystem:
         iq_signal = raw_data[::2] + 1j * raw_data[1::2]
         duration = len(iq_signal) / fs
 
-        # 2. 预处理 (使用复刻的 v8 逻辑)
+        # 2. 预处理
         img_large, shape_large = self._process_stft_v8_aligned(iq_signal, fs, FREQ_RES_LARGE)
         h_L, w_L = shape_large[0], shape_large[1]
         
         img_small_full, shape_small = self._process_stft_v8_aligned(iq_signal, fs, FREQ_RES_SMALL)
         h_S, w_S = shape_small[0], shape_small[1]
         
-        # 3. 推理 (Large) 
-        # [关键] imgsz=640, rect=False, conf=0.001 (传参进来)
+        # 3. 推理 (Large) - [核心] rect=True
         res_large_list = self.model_large.predict(
             img_large, 
             conf=conf_thres, 
@@ -165,7 +159,7 @@ class SignalInferenceSystem:
             device=self.device, 
             verbose=False, 
             imgsz=640,  
-            rect=False 
+            rect=True  # <--- 必须开启，否则宽带信号特征会因填充丢失
         )
         res_large = res_large_list[0]
         
@@ -184,7 +178,8 @@ class SignalInferenceSystem:
                 iou=iou_thres, 
                 device=self.device, 
                 verbose=False, 
-                imgsz=640
+                imgsz=640,
+                rect=False # 切片已经是正方形，无需 rect
             )
             res_slice = res_slice_list[0]
             
@@ -211,7 +206,7 @@ class SignalInferenceSystem:
                 keep_indices = torchvision.ops.nms(small_tensor[:, :4], small_tensor[:, 4], 0.3)
                 final_small_preds = small_tensor[keep_indices].cpu().numpy()
 
-        # 6. 坐标逆归一化 + 格式化
+        # 6. 坐标逆归一化 (统一转换为物理坐标)
         predictions = []
 
         def pixel_to_physical(px_box, img_w, img_h):
@@ -222,7 +217,7 @@ class SignalInferenceSystem:
             freq_end   = (y2 / img_h) * bw_mhz + f_min
             return t_start, t_end, freq_start, freq_end
 
-        # 处理 Large
+        # 处理 Large 结果
         if res_large.boxes is not None:
             boxes_large_data = res_large.boxes.data
             if boxes_large_data is not None and len(boxes_large_data) > 0:
@@ -238,13 +233,10 @@ class SignalInferenceSystem:
                             "start_frequency": float(min(fs, fe)), 
                             "end_frequency": float(max(fs, fe)),
                             "confidence": float(box[4]),
-                            "source": "large",
-                            # [新增] 返回原始像素坐标用于IoU计算
-                            "box_px": box[:4].tolist(),
-                            "img_dims": (w_L, h_L)
+                            "source": "large"
                         })
 
-        # 处理 Small
+        # 处理 Small 结果
         for box in final_small_preds:
             cls_id = int(box[5])
             if cls_id in SMALL_TARGET_CLASSES: 
@@ -256,11 +248,7 @@ class SignalInferenceSystem:
                     "start_frequency": float(min(fs, fe)), 
                     "end_frequency": float(max(fs, fe)),
                     "confidence": float(box[4]),
-                    "source": "small",
-                    # [注意] 这里 Small 的像素坐标是相对于 Small STFT 的，不能直接和 Large 混用计算
-                    # 计算 mAP 最好统一用物理坐标
-                    "box_px": box[:4].tolist(),
-                    "img_dims": (w_S, h_S)
+                    "source": "small"
                 })
         
         return predictions, img_large, (w_L, h_L), meta, debug_slices

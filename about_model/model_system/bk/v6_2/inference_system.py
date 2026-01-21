@@ -30,7 +30,7 @@ FIXED_NPERSEG_LARGE = 1024
 FREQ_RES_KHZ_LARGE = 20
 
 USE_DB_SCALE_LARGE = False
-NORM_TYPE_LARGE = 'SAMPLE' # 'SAMPLE' or 'GLOBAL'
+NORM_TYPE_LARGE = 'SAMPLE'      # 'SAMPLE' or 'GLOBAL'
 GLOBAL_MIN_DB_LARGE = -140.0
 GLOBAL_MAX_DB_LARGE = 30.0
 
@@ -43,7 +43,7 @@ SAVE_IMAGE_FORMAT_SMALL = 'jpg'
 FREQ_RES_KHZ_SMALL = 5
 
 USE_DB_SCALE_SMALL = False
-NORM_TYPE_SMALL = 'SAMPLE' # 'SAMPLE' or 'GLOBAL'
+NORM_TYPE_SMALL = 'SAMPLE'      # 'SAMPLE' or 'GLOBAL'
 GLOBAL_MIN_DB_SMALL = -140.0
 GLOBAL_MAX_DB_SMALL = 30.0
 
@@ -195,7 +195,7 @@ class SignalInferenceSystem:
             merged_boxes.append(current_box)
         return np.array(merged_boxes)
 
-    def predict(self, bin_path, json_path, conf_thres=0.2, iou_thres=0.7):
+    def predict(self, bin_path, json_path, conf_thres=0.001, iou_thres=0.7):
         """
         conf_thres: Confidence threshold for prediction
         iou_thres: NMS threshold
@@ -238,7 +238,7 @@ class SignalInferenceSystem:
         )
         h_S, w_S = shape_small[0], shape_small[1]
         
-        # 4. Inference (Large) - Rect=True
+        # 4. Inference (Large) - Rect=False
         res_large_list = self.model_large.predict(
             img_large, 
             conf=conf_thres, 
@@ -246,7 +246,7 @@ class SignalInferenceSystem:
             device=self.device, 
             verbose=False, 
             imgsz=640,  
-            rect=True  
+            rect=False  
         )
         res_large = res_large_list[0]
         

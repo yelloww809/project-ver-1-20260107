@@ -1,4 +1,7 @@
 import numpy as np
+import matplotlib
+# [核心修复] 强制使用非交互式后端，不需要GUI支持，速度更快且不会报错
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import cv2
@@ -8,273 +11,201 @@ import torch
 from pathlib import Path
 from tqdm import tqdm
 from inference_system import SignalInferenceSystem
-# [关键] 导入 Ultralytics 官方评估工具
-from ultralytics.utils.metrics import ap_per_class
+# [核心] 导入官方计算函数
+from ultralytics.utils.metrics import ap_per_class, box_iou
 
 # ================= 配置 =================
-TEST_DIR = Path(r'E:\huangwenhao\processed_datasets\dataset_test') 
-OUTPUT_DIR = Path(r'E:\huangwenhao\test_results')
-LARGE_MODEL = r'runs/detect/train_large/weights/best.pt'
-SMALL_MODEL = r'runs/detect/train_small/weights/best.pt'
+TEST_DIR = Path(r'E:\huangwenhao\processed_datasets\dataset_test')  # Test集路径
+OUTPUT_DIR = Path(r'E:\huangwenhao\test_results\test_results_v3_2') # 结果保存路径
+# 请确保这两个路径指向你真实的 .pt 文件
+LARGE_MODEL = r'E:\huangwenhao\runs\v8\train\train_v8_large_jpg_1\weights\best.pt'
+SMALL_MODEL = r'E:\huangwenhao\runs\v8\train\train_v8_small_jpg_1_epochs40\weights\best.pt'
+DEVICE = 'cuda:0'
 FONT_SIZE = 8
 
-def phys2pix_for_eval(val_t, val_f, duration_ms, f_range, img_w, img_h):
-    """物理坐标 -> 虚拟像素坐标 (用于统一尺度计算IoU)"""
+def phys2pix_eval(val_t, val_f, duration_ms, f_range, img_w, img_h):
+    """物理坐标 -> 绘图用像素坐标"""
     x = (val_t / duration_ms) * img_w
     y = ((val_f - f_range[0]) / (f_range[1] - f_range[0])) * img_h
     return x, y
 
-def process_batch_for_ultralytics(preds, gts, meta, bin_file):
+def compute_tp_fp_per_image(preds, gts, meta, bin_file, iou_thresholds):
     """
-    将物理坐标转换为统一的 tensor 格式，供 ap_per_class 使用
-    为了统一计算，我们将所有坐标映射到一个虚拟的 1000x1000 空间计算 IoU
+    计算单张图的 TP 矩阵，严格按类别隔离匹配。
+    输入输出均使用物理坐标 (ms, MHz)，无需转回像素坐标。
     """
-    # 获取物理参数
-    obs = meta['observation_range']
-    raw_data = np.fromfile(bin_file, dtype=np.float16)
-    iq_signal = raw_data[::2] + 1j * raw_data[1::2]
-    fs = (obs[1] - obs[0]) * 1e6
-    duration_ms = (len(iq_signal) / fs) * 1000
+    # 1. 准备物理参数
+    # 在这里我们直接使用物理坐标计算 IoU，不需要转换到像素
     
-    # 虚拟画布大小 (只要统一即可，不影响IoU比例)
-    V_W, V_H = 1000.0, 1000.0
-
-    # 1. 处理 GT
-    target_cls = []
-    target_bboxes = []
-    for g in gts:
-        target_cls.append(int(g['class']))
-        x1, y1 = phys2pix_for_eval(g['start_time'], g['start_frequency'], duration_ms, obs, V_W, V_H)
-        x2, y2 = phys2pix_for_eval(g['end_time'], g['end_frequency'], duration_ms, obs, V_W, V_H)
-        target_bboxes.append([x1, y1, x2, y2])
-    
-    # 2. 处理 Preds
-    pred_cls = []
-    pred_bboxes = []
-    pred_conf = []
+    # 2. 整理 Preds (物理坐标)
+    # 格式: [t1, f1, t2, f2, conf, cls]
+    p_boxes = []
     for p in preds:
-        pred_cls.append(int(p['class']))
-        pred_conf.append(float(p['confidence']))
-        x1, y1 = phys2pix_for_eval(p['start_time'], p['start_frequency'], duration_ms, obs, V_W, V_H)
-        x2, y2 = phys2pix_for_eval(p['end_time'], p['end_frequency'], duration_ms, obs, V_W, V_H)
-        pred_bboxes.append([x1, y1, x2, y2])
+        p_boxes.append([p['start_time'], p['start_frequency'], p['end_time'], p['end_frequency'], p['confidence'], p['class']])
+    p_boxes = torch.tensor(p_boxes) if len(p_boxes) > 0 else torch.zeros((0, 6))
 
-    # 转换为 Tensor
-    if len(target_bboxes) > 0:
-        target_bboxes = torch.tensor(target_bboxes)
-        target_cls = torch.tensor(target_cls)
-    else:
-        target_bboxes = torch.zeros((0, 4))
-        target_cls = torch.zeros((0,))
+    # 3. 整理 GTs (物理坐标)
+    g_boxes = []
+    for g in gts:
+        g_boxes.append([g['start_time'], g['start_frequency'], g['end_time'], g['end_frequency'], g['class']])
+    g_boxes = torch.tensor(g_boxes) if len(g_boxes) > 0 else torch.zeros((0, 5))
 
-    if len(pred_bboxes) > 0:
-        pred_bboxes = torch.tensor(pred_bboxes)
-        pred_conf = torch.tensor(pred_conf)
-        pred_cls = torch.tensor(pred_cls)
-    else:
-        pred_bboxes = torch.zeros((0, 4))
-        pred_conf = torch.zeros((0,))
-        pred_cls = torch.zeros((0,))
+    # 4. 初始化
+    correct = torch.zeros(len(p_boxes), len(iou_thresholds), dtype=torch.bool)
+    
+    if len(p_boxes) == 0:
+        return correct, torch.tensor([]), torch.tensor([]), g_boxes[:, 4] if len(g_boxes) > 0 else torch.tensor([])
 
-    # 3. 计算 TP (使用 Ultralytics 的逻辑)
-    # iou_thres array: 0.5, 0.55, ... 0.95
-    iou_v = torch.linspace(0.5, 0.95, 10)
-    
-    if len(pred_bboxes) == 0:
-        return np.zeros((0, 10), dtype=bool), np.array([]), np.array([]), target_cls.numpy()
-    
-    if len(target_bboxes) == 0:
-        # 有预测没GT -> 全是FP
-        tp = np.zeros((len(pred_bboxes), 10), dtype=bool)
-        return tp, pred_conf.numpy(), pred_cls.numpy(), np.array([])
+    # 5. 按类别匹配
+    unique_classes = torch.unique(torch.cat([p_boxes[:, 5], g_boxes[:, 4]])) if len(g_boxes) > 0 else torch.unique(p_boxes[:, 5])
 
-    # 计算 IoU Matrix
-    # box_iou 是 Ultralytics 内部函数，这里我们手写一个简单的
-    from ultralytics.utils.metrics import box_iou
-    iou = box_iou(target_bboxes, pred_bboxes) # [M, N]
-    
-    # 计算 TP 矩阵 [N, 10]
-    # 需要匹配 Ultralytics 的 match_predictions 逻辑
-    # 为了简单，直接调用内部函数有点复杂，我们复用 ap_per_class 需要的输入：
-    # ap_per_class 需要 tp 矩阵，我们需要自己算 batch match
-    
-    # 这里我们借用 Ultralytics 的 batch_probiou 或者简单的 match 逻辑
-    # 鉴于环境配置，我们直接写一个简单的 match_predictions 函数，仿照 Ultralytics
-    
-    matches = match_predictions(pred_bboxes, target_bboxes, iou_v)
-    # matches: [N, 10] bool
-    
-    return matches.cpu().numpy(), pred_conf.numpy(), pred_cls.numpy(), target_cls.numpy()
-
-def match_predictions(pred_boxes, true_boxes, iou_thres):
-    """
-    仿照 Ultralytics match_predictions
-    pred_boxes: [N, 4]
-    true_boxes: [M, 4]
-    iou_thres: [10]
-    return: [N, 10] bool
-    """
-    from ultralytics.utils.metrics import box_iou
-    iou = box_iou(true_boxes, pred_boxes)
-    
-    correct = torch.zeros(pred_boxes.shape[0], iou_thres.shape[0], dtype=torch.bool, device=pred_boxes.device)
-    correct_class = torch.zeros_like(correct) # 我们在外面已经分了类，这里只做IoU匹配
-    
-    # 这里 ap_per_class 是按类计算的，所以我们这里只做纯 IoU 匹配
-    # 假设传入的已经是同一类的 boxes (稍后在外面循环调用)
-    # 或者我们直接对所有框做匹配，但 ap_per_class 内部会再次分类
-    # Ultralytics 的 ap_per_class 需要的 tp 输入是针对 global list 的
-    
-    # 让我们换个思路：直接在 process_batch 里，对每张图，计算出每个 pred 的 TP 状态
-    
-    x = torch.where(iou >= iou_thres[0]) # 筛选至少满足 0.5 的
-    if x[0].shape[0]:
-        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
-        if x[0].shape[0] > 1:
-            matches = matches[matches[:, 2].argsort()[::-1]]
-            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-            matches = matches[matches[:, 2].argsort()[::-1]]
-            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-    else:
-        matches = np.zeros((0, 3))
-
-    # 这部分逻辑稍微有点复杂，为了避免重复造轮子出错，建议：
-    # 既然我们要用 ap_per_class，它只需要 (tp, conf, pred_cls, target_cls)
-    # tp 是 [N_all, 10] 的 bool 矩阵。
-    # 我们需要在每张图内部，计算该图的 pred 在 10 个阈值下是否匹配到了 GT
-    
-    return _compute_tp_per_image(pred_boxes, true_boxes, iou_thres)
-
-def _compute_tp_per_image(pbox, tbox, iouv):
-    """
-    计算单张图片的 TP 矩阵 [N, 10]
-    pbox: [N, 4]
-    tbox: [M, 4]
-    iouv: [10] (0.5 ... 0.95)
-    """
-    import torch
-    from ultralytics.utils.metrics import box_iou
-    
-    ni = len(iouv)
-    correct = np.zeros((len(pbox), ni), dtype=bool)
-    
-    if len(tbox) == 0:
-        return correct
+    for cls in unique_classes:
+        # 筛选同类框
+        p_mask = (p_boxes[:, 5] == cls)
+        g_mask = (g_boxes[:, 4] == cls)
         
-    iou = box_iou(tbox, pbox) # [M, N]
-    
-    # 对每个 IoU 阈值
-    for i, threshold in enumerate(iouv):
-        # 找到所有大于阈值的匹配 (gt_idx, pred_idx)
-        matches = torch.nonzero(iou >= threshold) # [K, 2]
-        if matches.shape[0] == 0:
+        cls_p_boxes = p_boxes[p_mask]
+        cls_g_boxes = g_boxes[g_mask]
+        
+        p_indices = torch.where(p_mask)[0] # 记录原始索引
+
+        if len(cls_g_boxes) == 0 or len(cls_p_boxes) == 0:
             continue
-            
-        matches = matches.cpu().numpy()
-        # 添加 IoU 值作为第三列 [gt_idx, pred_idx, iou_val]
-        match_vals = iou[matches[:,0], matches[:,1]].cpu().numpy()
-        matches = np.hstack([matches, match_vals[:, None]])
-        
-        # 贪心策略：按 IoU 降序
-        # 1. Sort by IoU desc
-        matches = matches[matches[:, 2].argsort()[::-1]]
-        
-        # 2. Unique Preds (每个 Pred 最多匹配一个 GT)
-        # return_index=True 返回的是第一次出现的索引（因为已经降序，所以是最大的IoU）
-        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-        
-        # 3. Unique GTs (每个 GT 最多被一个 Pred 匹配)
-        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-        
-        # 记录 TP
-        for m in matches:
-            pred_idx = int(m[1])
-            correct[pred_idx, i] = True
-            
-    return correct
+
+        # 计算物理坐标下的 IoU [N_pred, M_gt]
+        iou = box_iou(cls_g_boxes[:, :4], cls_p_boxes[:, :4]) 
+
+        # 对每个阈值进行匹配
+        for i, iou_thr in enumerate(iou_thresholds):
+            matches = torch.nonzero(iou >= iou_thr) 
+            if matches.shape[0] > 0:
+                match_vals = iou[matches[:, 0], matches[:, 1]]
+                matches = torch.cat([matches, match_vals[:, None]], 1)
+                
+                # 按 IoU 降序
+                matches = matches[matches[:, 2].argsort(descending=True)]
+                # Pred 去重
+                _, unique_p_idx = np.unique(matches[:, 1].cpu().numpy(), return_index=True)
+                matches = matches[unique_p_idx]
+                # GT 去重
+                _, unique_g_idx = np.unique(matches[:, 0].cpu().numpy(), return_index=True)
+                matches = matches[unique_g_idx]
+                
+                # 填回 correct
+                relative_pred_indices = matches[:, 1].long()
+                absolute_pred_indices = p_indices[relative_pred_indices]
+                correct[absolute_pred_indices, i] = True
+
+    return correct, p_boxes[:, 4], p_boxes[:, 5], g_boxes[:, 4]
 
 def main():
-    system = SignalInferenceSystem(LARGE_MODEL, SMALL_MODEL)
+    system = SignalInferenceSystem(LARGE_MODEL, SMALL_MODEL, device=DEVICE)
     if OUTPUT_DIR.exists(): shutil.rmtree(OUTPUT_DIR)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
     bin_files = list(TEST_DIR.glob('*.bin'))
     
-    # 统计全局数据，用于最后计算
-    stats = [] # list of (tp, conf, pcls, tcls)
+    # # 如果文件太多，可以先测试 10 个
+    # bin_files = bin_files[:10]
+    
+    stats = [] 
+    # 定义评估用的 IoU 阈值: 0.5 - 0.95
+    iou_v = torch.linspace(0.5, 0.95, 10)
     
     print(f">>> Start Testing on {len(bin_files)} files...")
-    
-    # [关键] 评估模式：极低置信度阈值
-    EVAL_CONF = 0.001 
-    EVAL_IOU = 0.6
     
     for bin_file in tqdm(bin_files):
         json_file = bin_file.with_suffix('.json')
         if not json_file.exists(): continue
+        
         sample_dir = OUTPUT_DIR / bin_file.stem
         sample_dir.mkdir(parents=True, exist_ok=True)
         
         # 1. 运行预测
         preds, img_large, img_dims, meta, slices = system.predict(
             bin_file, json_file, 
-            conf_thres=EVAL_CONF, # 传入0.001
-            iou_thres=EVAL_IOU
+            conf_thres=0.2,  
+            iou_thres=0.7      
         )
         
-        # 2. 保存图片 (为了不产生太多垃圾文件，可以注释掉下面几行，或者只保存前几个)
-        # cv2.imwrite(str(sample_dir / f"{bin_file.stem}_large.jpg"), img_large)
-        # ...
-        
-        # 3. 计算 TP/FP 状态 (针对 ap_per_class)
-        gts = meta.get('signals', [])
-        tp, conf, pcls, tcls = process_batch_for_ultralytics(preds, gts, meta, bin_file)
-        
-        stats.append((tp, conf, pcls, tcls))
-        
-        # 4. 可视化 (可选)
-        # 注意：这里的 preds 包含大量低分框，画出来会全屏都是框
-        # 如果要画图，建议用高分阈值再跑一次 system.predict，或者在画图时过滤 preds
-        
-        # 这里仅保存 JSON 用于调试
+        # 2. 保存中间结果 (可选)
+        cv2.imwrite(str(sample_dir / f"{bin_file.stem}_large.jpg"), img_large)
+        for img_slice, suffix in slices:
+            cv2.imwrite(str(sample_dir / f"{bin_file.stem}{suffix}.jpg"), img_slice)
         system.save_results(preds, sample_dir / f"{bin_file.stem}_pred.json")
+            
+        # 3. 计算指标统计量
+        gts = meta.get('signals', [])
+        correct, conf, pcls, tcls = compute_tp_fp_per_image(preds, gts, meta, bin_file, iou_v)
+        # 将结果转回 CPU 以便后续拼接
+        stats.append((correct.cpu(), conf.cpu(), pcls.cpu(), tcls.cpu()))
+        
+        # 4. 可视化 (仅画高分框，避免图片被淹没)
+        # 准备绘图参数
+        h, w = img_dims[1], img_dims[0]
+        obs = meta['observation_range']
+        raw_data = np.fromfile(bin_file, dtype=np.float16)
+        iq_signal = raw_data[::2] + 1j * raw_data[1::2]
+        fs = (obs[1] - obs[0]) * 1e6
+        duration_ms = (len(iq_signal) / fs) * 1000
+        
+        # 画 GT (绿色)
+        fig_gt, ax_gt = plt.subplots(figsize=(12, 12 * h / w))
+        ax_gt.imshow(cv2.cvtColor(img_large, cv2.COLOR_BGR2RGB))
+        for g in gts:
+            x1, y1 = phys2pix_eval(g['start_time'], g['start_frequency'], duration_ms, obs, w, h)
+            x2, y2 = phys2pix_eval(g['end_time'], g['end_frequency'], duration_ms, obs, w, h)
+            rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='lime', facecolor='none')
+            ax_gt.add_patch(rect)
+            ax_gt.text(x1, y1-5, f"{g['class']}", color='lime', fontsize=FONT_SIZE)
+        plt.axis('off'); plt.savefig(sample_dir / f"{bin_file.stem}_GT.jpg"); plt.close(fig_gt)
+        
+        # 画 Pred (红色/橙色) - 过滤 conf < 0.25
+        fig_pred, ax_pred = plt.subplots(figsize=(12, 12 * h / w))
+        ax_pred.imshow(cv2.cvtColor(img_large, cv2.COLOR_BGR2RGB))
+        for p in preds:
+            if p['confidence'] < 0.25: continue # <--- 仅为了可视化清晰
+            x1, y1 = phys2pix_eval(p['start_time'], p['start_frequency'], duration_ms, obs, w, h)
+            x2, y2 = phys2pix_eval(p['end_time'], p['end_frequency'], duration_ms, obs, w, h)
+            color = 'red' if p['source'] == 'small' else 'orange'
+            rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor=color, facecolor='none')
+            ax_pred.add_patch(rect)
+            ax_pred.text(x1, y1-5, f"{p['class']} {p['confidence']:.2f}", color=color, fontsize=FONT_SIZE)
+        plt.axis('off'); plt.savefig(sample_dir / f"{bin_file.stem}_Pred.jpg"); plt.close(fig_pred)
 
-    # --- 计算最终指标 (使用 Ultralytics) ---
-    print("\n>>> Computing Final Metrics using Ultralytics ap_per_class...")
+    # --- 最终指标计算 ---
+    print("\n>>> Computing Final Metrics with Ultralytics...")
+    # 拼接所有批次的数据 (此时它们还是 Tensor)
+    stats = [torch.cat(x, 0) for x in zip(*stats)]
+    tp, conf, pcls, tcls = stats
     
-    stats = [np.concatenate(x, 0) for x in zip(*stats)] 
-    # tp: [N_all, 10], conf: [N_all], pcls: [N_all], tcls: [M_all]
-    
-    if len(stats) and stats[0].any():
-        tp, conf, pcls, tcls = stats
-        # ap_per_class 自动计算 P, R, AP, F1 等
-        # plot=False 禁止画图 (我们需要matplotlib对象的话可以True)
-        # names: 类别名称字典
+    if tp.shape[0] > 0:
         names = {i: str(i) for i in range(14)}
         
-        results = ap_per_class(tp, conf, pcls, tcls, plot=False, names=names)
+        # [关键修正] 调用前将 Tensor 转换为 Numpy
+        results = ap_per_class(
+            tp.numpy(), 
+            conf.numpy(), 
+            pcls.numpy(), 
+            tcls.numpy(), 
+            plot=False, 
+            names=names
+        )
         
-        # results: (tp, fp, p, r, f1, ap_unique_classes, ap)
-        # ap: [N_cls, 10] -> mean over 10 gives mAP50-95, column 0 gives mAP50
+        # 解析结果
+        p, r, ap50, ap, unique_classes = results[2], results[3], results[5][:, 0], results[5].mean(1), results[6]
         
-        p, r, ap50, ap = results[2], results[3], results[6][:, 0], results[6].mean(1)
-        
-        print("\n" + "="*85)
+        print("\n" + "="*90)
         print(f"{'Class':<10} | {'P':<10} | {'R':<10} | {'mAP@.50':<10} | {'mAP@.5-.95':<12}")
-        print("-" * 85)
-        
-        # ap_unique_classes 是实际出现的类别索引
-        unique_classes = results[5]
-        
+        print("-" * 90)
+        # unique_classes = results[5]
         for i, c in enumerate(unique_classes):
             print(f"{int(c):<10} | {p[i]:.4f}     | {r[i]:.4f}     | {ap50[i]:.4f}     | {ap[i]:.4f}")
-            
-        print("-" * 85)
+        print("-" * 90)
         print(f"{'ALL':<10} | {p.mean():.4f}     | {r.mean():.4f}     | {ap50.mean():.4f}     | {ap.mean():.4f}")
-        print("=" * 85)
-        
+        print("=" * 90)
     else:
-        print("No detections found!")
+        print("No valid predictions found.")
 
 if __name__ == "__main__":
     main()

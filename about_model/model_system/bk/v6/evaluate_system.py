@@ -18,18 +18,18 @@ from ultralytics.utils.metrics import ap_per_class, box_iou
 #                                 CONFIGURATION
 # ==============================================================================
 TEST_DIR = Path(r'E:\huangwenhao\processed_datasets\dataset_test')  # Test集路径
-OUTPUT_DIR = Path(r'E:\huangwenhao\test_results\test_results_v6')  # 结果保存路径
+OUTPUT_DIR = Path(r'E:\huangwenhao\results\v9\system\test_system_v6_large_2_1_small_1_1_conf0.2')  # 结果保存路径
 
 # 模型路径
-LARGE_MODEL = r'E:\huangwenhao\runs\v8\train\train_v8_large_jpg_1\weights\best.pt'
-SMALL_MODEL = r'E:\huangwenhao\runs\v8\train\train_v8_small_jpg_1_epochs40\weights\best.pt'
+LARGE_MODEL = r'E:\huangwenhao\results\v9\train\train_v9_large_2_1\weights\best.pt'
+SMALL_MODEL = r'E:\huangwenhao\results\v9\train\train_v9_small_1_1\weights\best.pt'
 DEVICE = 'cuda:0'
 FONT_SIZE = 8
 
 # [评估参数] 
 # 注意：这里设置的值会覆盖 inference_system.py 中的默认参数
-CONF_THRES = 0.20  
-IOU_THRES = 0.60   
+CONF_THRES = 0.2
+IOU_THRES = 0.70   
 
 # [可视化限制]
 VIS_LIMIT = 50 
